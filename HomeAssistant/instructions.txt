@@ -1,0 +1,31 @@
+Step 1: Connect to a WiFi network
+Turn on the controller. When you first start it (or if it doesn't know your home network), it will create its own WiFi hotspot.
+Find a network: Find a WiFi network with a name like LightTrack_XXXXXX on your phone or computer
+Connect to it: Use the password 12345678
+Open a browser: Go to http://192.168.4.1. You should see the controller's web interface.
+Configure WiFi:
+Click the WiFi Settings link.
+Click the Scan Networks button.
+Select your home WiFi network from the list (SSID).
+Enter the password for your home WiFi network.
+Click Save & Connect.
+The controller will reboot and try to connect to your network. The LightTrack_XXXXXX hotspot should disappear.
+Find a new IP: Find out the IP address that your router gave to the controller. This can be done through the router interface or by using network scanning software (e.g. Fing on your phone). Look for a device named LightTrack_XXXXXX or by its MAC address.
+Step 2: Configure MQTT
+Open your browser: Now use the new IP address you found in step 1 (e.g. http://192.168.1.123). You will see the web interface again.
+Go to MQTT settings: Click on the MQTT Settings link.
+Enter the broker details:
+MQTT Server Address: The IP address of your Home Assistant or a separate MQTT broker (e.g. Mosquitto) that Home Assistant is connected to.
+Port: Usually 1883.
+Username: Username to connect to MQTT (if configured in Home Assistant).
+Password: Password for this MQTT user.
+Save: Click Save MQTT Settings.
+Step 3: Check in Home Assistant
+Autodiscovery: If everything is set up correctly, the controller will send autodiscovery data (MQTT Discovery) to Home Assistant.
+Finding the device: After a while (up to a minute), a new device named LightTrack_XXXXXX should appear in Home Assistant under Settings -> Devices and Services -> Devices. If you already have MQTT integration, the device may appear there.
+Entities: Along with the device, its entities should appear (light, switch for background mode, number for settings). You will be able to control the light and its parameters through Home Assistant.
+If something does not work:
+Check the IP address of the controller: Make sure you are using the correct IP after connecting to your home network.
+Check the MQTT data: Make sure the broker IP address, port, login and password are entered correctly.
+Check MQTT settings in Home Assistant: Make sure that the MQTT integration in Home Assistant is working and configured to accept autodiscovery messages (usually enabled by default).
+View logs: In Home Assistant, you can view the MQTT broker logs, and in the controller web interface (if connected via Serial), you can see messages about WiFi or MQTT connection errors.
