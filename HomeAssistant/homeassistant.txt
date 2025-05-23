@@ -1,0 +1,586 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <FastLED.h>
+#include <EEPROM.h>
+#include <SPIFFS.h>
+#include <math.h>       // For isnan
+#include "esp_wifi.h"
+#include <time.h>
+#include <ArduinoOTA.h>
+#include <stdlib.h>
+
+// --- MQTT INTEGRATION START ---
+#include <PubSubClient.h> // For MQTT
+#include <ArduinoJson.h>  // For JSON messages
+// --- MQTT INTEGRATION END ---
+
+// ------------------------- LED Configuration -------------------------
+#define LED_PIN             2
+#define NUM_LEDS            300
+#define CHIPSET             WS2812B
+#define COLOR_ORDER         GRB
+CRGB leds[NUM_LEDS];
+
+// ------------------------- Sensor Parameters -------------------------
+#define SENSOR_HEADER       0xAA
+#define MIN_DISTANCE        20
+#define MAX_DISTANCE        1000
+#define DEFAULT_DISTANCE    1000
+#define NOISE_THRESHOLD     5
+
+// ------------------------- Display Parameters -------------------------
+int updateInterval = 20;
+float movingIntensity = 0.3;      // Stored as 0.0-1.0
+float stationaryIntensity = 0.03; // Stored as 0.0-0.1 (0-10%)
+int movingLength = 33;
+int centerShift = 0;
+int additionalLEDs = 0;
+CRGB baseColor = CRGB(255, 200, 50); // This is the color variable
+int ledOffDelay = 5;
+int gradientSoftness = 7; // Gradient configuration
+
+// Global sensor distance
+volatile unsigned int g_sensorDistance = DEFAULT_DISTANCE;
+
+// Background Light Mode (Used by Web UI toggle primarily now)
+volatile bool backgroundModeActive = false;
+
+// ------------------------- Time and Schedule Parameters (Local Time Logic) -------------------------
+int startHour   = 20; // Start time (local)
+int startMinute = 0;
+int endHour     = 8;  // End time (local)
+int endMinute   = 30;
+bool lightOn    = true; // Current light state (based on schedule or manual override)
+unsigned long lastTimeCheck = 0; // For periodic time checks
+volatile bool smarthomeOverride = false; // Flag for manual control
+
+// Variables for local time
+volatile int clientTimezoneOffsetMinutes = 0; // Client offset from UTC in minutes (East +, West -)
+volatile bool isTimeOffsetSet = false;       // Flag indicating offset has been set
+
+// --- MQTT INTEGRATION START ---
+// ############################################################################
+// ##               MQTT & HOME ASSISTANT CONFIGURATION                    ##
+// ############################################################################
+
+// --- Wi-Fi Credentials (ESP32 will connect to this network) ---
+const char* main_wifi_ssid = "YOUR_WIFI_SSID";       // <<<### CHANGE THIS: Your Home Wi-Fi SSID
+const char* main_wifi_password = "YOUR_WIFI_PASSWORD"; // <<<### CHANGE THIS: Your Home Wi-Fi Password
+
+// --- MQTT Broker Settings ---
+const char* mqtt_server = "IP_OF_YOUR_HA_MACHINE"; // <<<### CHANGE THIS: IP address of your Home Assistant server
+const int mqtt_port = 1883;                        // Default MQTT port
+
+// --- MQTT User Credentials ---
+// Create a dedicated user in Home Assistant for MQTT (Settings > People > Users)
+const char* mqtt_user = "HA_MQTT_USER";            // <<<### CHANGE THIS: Username for MQTT
+const char* mqtt_pass = "HA_MQTT_PASSWORD";        // <<<### CHANGE THIS: Password for MQTT User
+// ---------------------------
+
+// --- MQTT Client and Topics (Auto-generated based on MAC address) ---
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+String mqtt_device_id = "";         // Will be: "lighttrack_XXXXXX"
+String mqtt_topic_base = "";      // Will be: "lighttrack/lighttrack_XXXXXX"
+
+// Main Light Topics
+String ha_state_topic = "";         // Will be: "lighttrack/lighttrack_XXXXXX/state"
+String ha_command_topic = "";       // Will be: "lighttrack/lighttrack_XXXXXX/set"
+String ha_availability_topic = "";  // Will be: "lighttrack/lighttrack_XXXXXX/availability"
+String ha_discovery_topic = "";     // Will be: "homeassistant/light/lighttrack_XXXXXX/config"
+
+// --- Topics for additional number entities ---
+String ha_number_mv_len_state_topic = "";     // Moving Length State
+String ha_number_mv_len_cmd_topic = "";       // Moving Length Command
+String ha_number_add_leds_state_topic = "";   // Additional LEDs State
+String ha_number_add_leds_cmd_topic = "";     // Additional LEDs Command
+String ha_number_gradient_state_topic = "";   // Gradient Softness State
+String ha_number_gradient_cmd_topic = "";     // Gradient Softness Command
+String ha_number_center_shift_state_topic = ""; // Center Shift State
+String ha_number_center_shift_cmd_topic = "";   // Center Shift Command
+String ha_number_off_delay_state_topic = "";    // LED Off Delay State
+String ha_number_off_delay_cmd_topic = "";      // LED Off Delay Command
+String ha_number_stat_intens_state_topic = ""; // Stationary Intensity State (0-100.0)
+String ha_number_stat_intens_cmd_topic = "";   // Stationary Intensity Command (0-100.0)
+
+const char* HA_PAYLOAD_ONLINE = "online";
+const char* HA_PAYLOAD_OFFLINE = "offline";
+
+// --- Home Assistant Effects ---
+const char* HA_EFFECT_SOLID = "Solid";
+const char* HA_EFFECT_BACKGROUND = "Background";
+const char* HA_EFFECT_SCHEDULE = "Schedule";
+const char* HA_EFFECT_STATIONARY = "Stationary";
+const char* effect_list[] = {HA_EFFECT_SOLID, HA_EFFECT_BACKGROUND, HA_EFFECT_SCHEDULE, HA_EFFECT_STATIONARY};
+const int num_effects = sizeof(effect_list) / sizeof(effect_list[0]);
+
+String current_ha_effect = HA_EFFECT_SOLID; // Current HA effect active
+
+unsigned long lastMqttReconnectAttempt = 0;
+const long mqttReconnectInterval = 5000; // milliseconds
+
+// Discovery Flags
+bool mqtt_discovery_published = false;         // For the main light entity
+bool mqtt_discovery_numbers_published = false; // For the number entities
+
+TaskHandle_t mqttTaskHandle = NULL;
+
+// Forward declaration for functions
+void saveSettings();
+void handleSmartHomeClear(bool isHttpRequest);
+void updateTime();
+void publishState(); // MQTT publish main light state
+void publishParameterStates(); // MQTT publish number parameter states
+bool setupWiFi();    // Modified to return bool
+void setupOTA();
+void mqttCallback(char* topic, byte* payload, unsigned int length); // MQTT callback
+void generateMqttIdAndTopics(); // Generates ID and ALL topics
+void publishDiscovery(); // Publishes all discovery messages
+void publishNumberDiscovery(const String&, const String&, const String&, const String&, const char*, int, int, float, const char*); // Helper
+
+// ############################################################################
+// ##                      END OF MQTT CONFIGURATION                         ##
+// ############################################################################
+// --- MQTT INTEGRATION END ---
+
+// ------------------------- EEPROM -------------------------
+#define EEPROM_SIZE 132
+void loadSettings() {
+  Serial.println("Loading settings from EEPROM...");
+  EEPROM.begin(EEPROM_SIZE);
+  int offset = 0;
+
+  EEPROM.get(offset, reinterpret_cast<int&>(updateInterval)); offset += sizeof(updateInterval);
+  EEPROM.get(offset, reinterpret_cast<int&>(ledOffDelay)); offset += sizeof(ledOffDelay);
+  EEPROM.get(offset, reinterpret_cast<float&>(movingIntensity)); offset += sizeof(movingIntensity);
+  EEPROM.get(offset, reinterpret_cast<float&>(stationaryIntensity)); offset += sizeof(stationaryIntensity);
+  EEPROM.get(offset, reinterpret_cast<int&>(movingLength)); offset += sizeof(movingLength);
+  EEPROM.get(offset, reinterpret_cast<int&>(centerShift)); offset += sizeof(centerShift);
+  { int temp = additionalLEDs; EEPROM.get(offset, temp); additionalLEDs = temp; offset += sizeof(temp); }
+  EEPROM.get(offset, baseColor); offset += sizeof(baseColor); // baseColor IS LOADED HERE
+  offset += sizeof(float); 
+  EEPROM.get(offset, startHour); offset += sizeof(startHour);
+  EEPROM.get(offset, startMinute); offset += sizeof(startMinute);
+  EEPROM.get(offset, endHour); offset += sizeof(endHour);
+  EEPROM.get(offset, endMinute); offset += sizeof(endMinute);
+  EEPROM.get(offset, gradientSoftness); offset += sizeof(gradientSoftness);
+  {
+    int temp_tz = 0;
+    EEPROM.get(offset, temp_tz);
+    if (temp_tz >= -720 && temp_tz <= 840) { clientTimezoneOffsetMinutes = temp_tz; isTimeOffsetSet = true; }
+    else { clientTimezoneOffsetMinutes = 0; isTimeOffsetSet = false; }
+    offset += sizeof(temp_tz);
+  }
+  EEPROM.end();
+
+  if (isnan(movingIntensity)) { Serial.println("Warning: movingIntensity was NaN, resetting to default."); movingIntensity = 0.3; }
+  if (isnan(stationaryIntensity)) { Serial.println("Warning: stationaryIntensity was NaN, resetting to default."); stationaryIntensity = 0.03; }
+
+  if (updateInterval < 10 || updateInterval > 200) updateInterval = 20;
+  if (ledOffDelay < 1 || ledOffDelay > 60) ledOffDelay = 5;
+  if (movingIntensity < 0.0 || movingIntensity > 1.0) movingIntensity = 0.3;
+  if (stationaryIntensity < 0.0 || stationaryIntensity > 0.1) stationaryIntensity = 0.03;
+  if (movingLength < 1 || movingLength > NUM_LEDS) movingLength = 33;
+  if (abs(centerShift) > NUM_LEDS/2) centerShift = 0;
+  if (additionalLEDs < 0 || additionalLEDs > NUM_LEDS/2) additionalLEDs = 0;
+  gradientSoftness = constrain(gradientSoftness, 0, 10);
+
+  bool scheduleInvalid = false;
+  if (startHour < 0 || startHour > 23 || startMinute < 0 || startMinute > 59 || endHour < 0 || endHour > 23 || endMinute < 0 || endMinute > 59) {
+      scheduleInvalid = true;
+  }
+  if (scheduleInvalid || (startHour == 0 && startMinute == 0 && endHour == 0 && endMinute == 0)){
+    Serial.println("Warning: Schedule was invalid or all zeros, resetting to default (20:00-08:30).");
+    startHour = 20; startMinute = 0; endHour = 8; endMinute = 30;
+  }
+
+  Serial.println("Settings loaded and validated:");
+  Serial.print("- Update interval: "); Serial.println(updateInterval);
+  Serial.print("- Moving intensity: "); Serial.print(movingIntensity * 100.0, 0); Serial.println("%");
+  Serial.print("- Stationary intensity: "); Serial.print(stationaryIntensity * 100.0, 1); Serial.println("%");
+  Serial.print("- Base Color (RGB): "); Serial.print(baseColor.r); Serial.print(", "); Serial.print(baseColor.g); Serial.print(", "); Serial.println(baseColor.b);
+  Serial.print("- Moving Length: "); Serial.println(movingLength);
+  // ... (other logs)
+}
+void saveSettings() {
+  Serial.println("Saving settings to EEPROM...");
+  EEPROM.begin(EEPROM_SIZE);
+  int offset = 0;
+  EEPROM.put(offset, updateInterval); offset += sizeof(updateInterval);
+  EEPROM.put(offset, ledOffDelay); offset += sizeof(ledOffDelay);
+  EEPROM.put(offset, movingIntensity); offset += sizeof(movingIntensity);
+  EEPROM.put(offset, stationaryIntensity); offset += sizeof(stationaryIntensity);
+  EEPROM.put(offset, movingLength); offset += sizeof(movingLength);
+  EEPROM.put(offset, centerShift); offset += sizeof(centerShift);
+  { int temp = additionalLEDs; EEPROM.put(offset, temp); offset += sizeof(temp); }
+  EEPROM.put(offset, baseColor); offset += sizeof(baseColor); // baseColor IS SAVED HERE
+  offset += sizeof(float); 
+  EEPROM.put(offset, startHour); offset += sizeof(startHour);
+  EEPROM.put(offset, startMinute); offset += sizeof(startMinute);
+  EEPROM.put(offset, endHour); offset += sizeof(endHour);
+  EEPROM.put(offset, endMinute); offset += sizeof(endMinute);
+  EEPROM.put(offset, gradientSoftness); offset += sizeof(gradientSoftness);
+  { int temp_tz = clientTimezoneOffsetMinutes; EEPROM.put(offset, temp_tz); offset += sizeof(temp_tz); }
+  boolean result = EEPROM.commit();
+  EEPROM.end();
+  Serial.print("Settings saved to EEPROM: "); Serial.println(result ? "OK" : "FAILED");
+}
+
+// --- MQTT INTEGRATION START ---
+void publishAvailability(bool available) {
+  if (!mqttClient.connected() && available) return;
+  if (mqttClient.connected() || !available) {
+    const char* payload = available ? HA_PAYLOAD_ONLINE : HA_PAYLOAD_OFFLINE;
+    if (ha_availability_topic != "") {
+        mqttClient.publish(ha_availability_topic.c_str(), payload, true);
+    }
+  }
+}
+
+void publishNumberDiscovery(
+    const String& param_id, const String& name_suffix, const String& state_topic,
+    const String& cmd_topic, const char* unit, int min_val, int max_val,
+    float step_val, const char* icon = "mdi:tune"
+    )
+{
+    if (!mqttClient.connected() || state_topic == "" || cmd_topic == "") return;
+    StaticJsonDocument<1024> doc;
+    String unique_id = mqtt_device_id + "_" + param_id;
+    String entity_name = "LightTrack " + name_suffix;
+    String discovery_topic_num = "homeassistant/number/" + unique_id + "/config";
+    doc["name"] = entity_name;
+    doc["unique_id"] = unique_id;
+    doc["stat_t"] = state_topic;
+    doc["cmd_t"] = cmd_topic;
+    doc["avty_t"] = ha_availability_topic;
+    doc["pl_avail"] = HA_PAYLOAD_ONLINE;
+    doc["pl_not_avail"] = HA_PAYLOAD_OFFLINE;
+    doc["min"] = min_val;
+    doc["max"] = max_val;
+    doc["step"] = step_val;
+    if (unit && strlen(unit) > 0) { doc["unit_of_meas"] = unit; }
+    doc["mode"] = "slider";
+    doc["icon"] = icon;
+    JsonObject device = doc.createNestedObject("device");
+    device["identifiers"] = mqtt_device_id;
+    String discoveryJson;
+    serializeJson(doc, discoveryJson);
+    Serial.print("MQTT Pub Number Discovery: "); Serial.println(discovery_topic_num);
+    if (!mqttClient.publish(discovery_topic_num.c_str(), discoveryJson.c_str(), true)) {
+         Serial.println(" -> FAILED.");
+    }
+}
+
+void publishDiscovery() {
+    if (!mqttClient.connected()) return;
+    if (!mqtt_discovery_published && ha_discovery_topic != "") {
+        StaticJsonDocument<1024> doc;
+        String deviceNameDisplay = "LightTrack " + mqtt_device_id.substring(mqtt_device_id.lastIndexOf('_') + 1);
+        doc["name"] = deviceNameDisplay;
+        doc["unique_id"] = mqtt_device_id;
+        doc["cmd_t"] = ha_command_topic;
+        doc["stat_t"] = ha_state_topic;
+        doc["avty_t"] = ha_availability_topic;
+        doc["pl_avail"] = HA_PAYLOAD_ONLINE;
+        doc["pl_not_avail"] = HA_PAYLOAD_OFFLINE;
+        doc["schema"] = "json";
+        doc["brightness"] = true;
+        doc["rgb"] = true; // THIS ENABLES COLOR CONTROL FOR THE LIGHT ENTITY
+        JsonArray effectList = doc.createNestedArray("effect_list");
+        for(int i=0; i < num_effects; i++){ effectList.add(effect_list[i]); }
+        doc["effect"] = true;
+        JsonObject device = doc.createNestedObject("device");
+        device["identifiers"] = mqtt_device_id;
+        device["name"] = deviceNameDisplay;
+        device["manufacturer"] = "DIY Yari & AI";
+        device["model"] = "ESP32-C3 LightTrack";
+        device["sw_version"] = "2.2-MQTT";
+        String discoveryJson;
+        serializeJson(doc, discoveryJson);
+        Serial.print("MQTT Pub Light Discovery to "); Serial.println(ha_discovery_topic);
+        if (mqttClient.publish(ha_discovery_topic.c_str(), discoveryJson.c_str(), true)) {
+            Serial.println(" -> Light Discovery published.");
+            mqtt_discovery_published = true;
+        } else {
+            Serial.println(" -> Light Discovery FAILED.");
+        }
+    }
+    if (!mqtt_discovery_numbers_published) {
+         Serial.println("Publishing Number discoveries...");
+         publishNumberDiscovery("moving_length", "Moving Length", ha_number_mv_len_state_topic, ha_number_mv_len_cmd_topic, "LEDs", 1, NUM_LEDS, 1.0, "mdi:arrow-split-vertical");
+         publishNumberDiscovery("additional_leds", "Trail LEDs", ha_number_add_leds_state_topic, ha_number_add_leds_cmd_topic, "LEDs", 0, NUM_LEDS / 2, 1.0, "mdi:ray-vertex-reverse");
+         publishNumberDiscovery("gradient", "Gradient", ha_number_gradient_state_topic, ha_number_gradient_cmd_topic, "", 0, 10, 1.0, "mdi:gradient-vertical");
+         publishNumberDiscovery("center_shift", "Center Shift", ha_number_center_shift_state_topic, ha_number_center_shift_cmd_topic, "LEDs", -NUM_LEDS / 2, NUM_LEDS / 2, 1.0, "mdi:arrow-expand-horizontal");
+         publishNumberDiscovery("off_delay", "Off Delay", ha_number_off_delay_state_topic, ha_number_off_delay_cmd_topic, "sec", 1, 60, 1.0, "mdi:timer-sand");
+         publishNumberDiscovery("stationary_intensity", "Background Intensity", ha_number_stat_intens_state_topic, ha_number_stat_intens_cmd_topic, "%", 0, 100, 0.1, "mdi:brightness-percent");
+         mqtt_discovery_numbers_published = true;
+         Serial.println("Number discoveries published.");
+    }
+}
+
+void publishParameterStates() {
+    if (!mqttClient.connected()) return;
+    char buffer[12];
+    if (ha_number_mv_len_state_topic != "") { snprintf(buffer, sizeof(buffer), "%d", movingLength); mqttClient.publish(ha_number_mv_len_state_topic.c_str(), buffer, true); }
+    if (ha_number_add_leds_state_topic != "") { snprintf(buffer, sizeof(buffer), "%d", additionalLEDs); mqttClient.publish(ha_number_add_leds_state_topic.c_str(), buffer, true); }
+    if (ha_number_gradient_state_topic != "") { snprintf(buffer, sizeof(buffer), "%d", gradientSoftness); mqttClient.publish(ha_number_gradient_state_topic.c_str(), buffer, true); }
+    if (ha_number_center_shift_state_topic != "") { snprintf(buffer, sizeof(buffer), "%d", centerShift); mqttClient.publish(ha_number_center_shift_state_topic.c_str(), buffer, true); }
+    if (ha_number_off_delay_state_topic != "") { snprintf(buffer, sizeof(buffer), "%d", ledOffDelay); mqttClient.publish(ha_number_off_delay_state_topic.c_str(), buffer, true); }
+    if (ha_number_stat_intens_state_topic != "") { snprintf(buffer, sizeof(buffer), "%.1f", stationaryIntensity * 1000.0); mqttClient.publish(ha_number_stat_intens_state_topic.c_str(), buffer, true); }
+}
+
+void publishState() {
+  if (!mqttClient.connected() || ha_state_topic == "") return;
+  StaticJsonDocument<384> doc;
+  doc["state"] = lightOn ? "ON" : "OFF";
+  doc["brightness"] = map(round(movingIntensity * 100), 0, 100, 0, 255);
+  JsonObject colorObj = doc.createNestedObject("color"); // THIS OBJECT IS FOR COLOR
+  colorObj["r"] = baseColor.r;
+  colorObj["g"] = baseColor.g;
+  colorObj["b"] = baseColor.b;
+  doc["effect"] = current_ha_effect;
+  String stateJson;
+  serializeJson(doc, stateJson);
+  if(!mqttClient.publish(ha_state_topic.c_str(), stateJson.c_str(), true)) {}
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    Serial.print("MQTT Recv ["); Serial.print(topic); Serial.print("] ");
+    char payloadStr[length + 1];
+    memcpy(payloadStr, payload, length);
+    payloadStr[length] = '\0';
+    Serial.println(payloadStr);
+    String topicStr = String(topic);
+    bool paramsNeedPublishing = false;
+
+    if (topicStr == ha_command_topic) {
+        StaticJsonDocument<256> doc;
+        DeserializationError error = deserializeJson(doc, payload, length);
+        if (error) { Serial.print("MQTT JSON Err: "); Serial.println(error.f_str()); return; }
+        bool stateChangedForSave = false; // To track if saveSettings is needed
+        bool publishNeeded = false;
+
+        if (doc.containsKey("state")) {
+            String stateValue = doc["state"];
+            if (stateValue == "ON") { if (!lightOn) { lightOn = true; stateChangedForSave = true; } smarthomeOverride = true; if (current_ha_effect == HA_EFFECT_SCHEDULE || current_ha_effect == HA_EFFECT_STATIONARY) { current_ha_effect = HA_EFFECT_SOLID; backgroundModeActive = false; }}
+            else if (stateValue == "OFF") { if (lightOn) { lightOn = false; stateChangedForSave = true; } smarthomeOverride = true; }
+            if(stateChangedForSave) publishNeeded = true;
+        }
+        if (doc.containsKey("brightness")) {
+            uint8_t brightness_val = doc["brightness"];
+            float newIntensity = constrain(map(brightness_val, 0, 255, 0, 100) / 100.0, 0.0, 1.0);
+            if (abs(movingIntensity - newIntensity) > 0.001) { movingIntensity = newIntensity; /* stateChangedForSave = true; */ } // Brightness change usually doesn't warrant EEPROM save immediately
+            smarthomeOverride = true;
+            if (!lightOn && brightness_val > 0) { lightOn = true; if (current_ha_effect == HA_EFFECT_SCHEDULE || current_ha_effect == HA_EFFECT_STATIONARY) { current_ha_effect = HA_EFFECT_SOLID; backgroundModeActive = false; }}
+            publishNeeded = true;
+        }
+        if (doc.containsKey("color")) { // COLOR IS HANDLED HERE
+            JsonObject colorObj = doc["color"];
+            CRGB newColor = CRGB(colorObj["r"], colorObj["g"], colorObj["b"]);
+            if (baseColor != newColor) { baseColor = newColor; stateChangedForSave = true; }
+            smarthomeOverride = true;
+            if (!lightOn) { lightOn = true; if (current_ha_effect == HA_EFFECT_SCHEDULE || current_ha_effect == HA_EFFECT_STATIONARY) { current_ha_effect = HA_EFFECT_SOLID; backgroundModeActive = false; }}
+            publishNeeded = true;
+        }
+        if (doc.containsKey("effect")) {
+            String effect_str = doc["effect"]; bool effectMatched = false;
+            for(int i=0; i < num_effects; i++){ if(effect_str == effect_list[i]){ if (current_ha_effect != effect_list[i]) { current_ha_effect = effect_list[i]; stateChangedForSave = true; } effectMatched = true; break; }}
+            if(effectMatched){
+                Serial.print("MQTT Effect set to: "); Serial.println(current_ha_effect);
+                if (current_ha_effect == HA_EFFECT_SCHEDULE) { smarthomeOverride = false; backgroundModeActive = false; handleSmartHomeClear(false); publishNeeded = false; }
+                else { smarthomeOverride = true; if (current_ha_effect == HA_EFFECT_SOLID) { backgroundModeActive = false; } else if (current_ha_effect == HA_EFFECT_BACKGROUND) { backgroundModeActive = true; } else if (current_ha_effect == HA_EFFECT_STATIONARY) { backgroundModeActive = true; } if (!lightOn) { lightOn = true; }}
+                publishNeeded = true;
+            } else { Serial.print("MQTT Unknown effect: "); Serial.println(effect_str); }
+        }
+        if(publishNeeded){ publishState(); }
+        // if(stateChangedForSave){ saveSettings(); } // Decide if these changes should be saved
+    }
+    else if (topicStr == ha_number_mv_len_cmd_topic) { int val = atoi(payloadStr); val = constrain(val, 1, NUM_LEDS); if (movingLength != val) { movingLength = val; paramsNeedPublishing = true; saveSettings(); }}
+    else if (topicStr == ha_number_add_leds_cmd_topic) { int val = atoi(payloadStr); val = constrain(val, 0, NUM_LEDS / 2); if (additionalLEDs != val) { additionalLEDs = val; paramsNeedPublishing = true; saveSettings(); }}
+    else if (topicStr == ha_number_gradient_cmd_topic) { int val = atoi(payloadStr); val = constrain(val, 0, 10); if (gradientSoftness != val) { gradientSoftness = val; paramsNeedPublishing = true; saveSettings(); }}
+    else if (topicStr == ha_number_center_shift_cmd_topic) { int val = atoi(payloadStr); val = constrain(val, -NUM_LEDS / 2, NUM_LEDS / 2); if (centerShift != val) { centerShift = val; paramsNeedPublishing = true; saveSettings(); }}
+    else if (topicStr == ha_number_off_delay_cmd_topic) { int val = atoi(payloadStr); val = constrain(val, 1, 60); if (ledOffDelay != val) { ledOffDelay = val; paramsNeedPublishing = true; saveSettings(); }}
+    else if (topicStr == ha_number_stat_intens_cmd_topic) { float val_percent = atof(payloadStr); float newIntensity = constrain(val_percent / 1000.0, 0.0, 0.1); if (abs(stationaryIntensity - newIntensity) > 0.0001) { stationaryIntensity = newIntensity; paramsNeedPublishing = true; saveSettings(); }}
+    if (paramsNeedPublishing) { publishParameterStates(); }
+}
+
+void generateMqttIdAndTopics() {
+    uint8_t mac[6]; WiFi.macAddress(mac); mqtt_device_id = "lighttrack_"; char mac_part[3];
+    for (int i = 3; i < 6; i++){ sprintf(mac_part, "%02X", mac[i]); mqtt_device_id += mac_part; }
+    Serial.print("MQTT Device ID generated: "); Serial.println(mqtt_device_id);
+    mqtt_topic_base = "lighttrack/" + mqtt_device_id;
+    ha_availability_topic = mqtt_topic_base + "/availability";
+    ha_state_topic = mqtt_topic_base + "/state";
+    ha_command_topic = mqtt_topic_base + "/set";
+    ha_discovery_topic = "homeassistant/light/" + mqtt_device_id + "/config";
+    ha_number_mv_len_state_topic = mqtt_topic_base + "/moving_length/state"; ha_number_mv_len_cmd_topic = mqtt_topic_base + "/moving_length/set";
+    ha_number_add_leds_state_topic = mqtt_topic_base + "/additional_leds/state"; ha_number_add_leds_cmd_topic = mqtt_topic_base + "/additional_leds/set";
+    ha_number_gradient_state_topic = mqtt_topic_base + "/gradient/state"; ha_number_gradient_cmd_topic = mqtt_topic_base + "/gradient/set";
+    ha_number_center_shift_state_topic = mqtt_topic_base + "/center_shift/state"; ha_number_center_shift_cmd_topic = mqtt_topic_base + "/center_shift/set";
+    ha_number_off_delay_state_topic = mqtt_topic_base + "/off_delay/state"; ha_number_off_delay_cmd_topic = mqtt_topic_base + "/off_delay/set";
+    ha_number_stat_intens_state_topic = mqtt_topic_base + "/stationary_intensity/state"; ha_number_stat_intens_cmd_topic = mqtt_topic_base + "/stationary_intensity/set";
+    if (String(WiFi.getHostname()) != mqtt_device_id && !String(WiFi.getHostname()).startsWith("LightTrack-OTA-")) { if (WiFi.setHostname(mqtt_device_id.c_str())) { Serial.print("WiFi Hostname set to: "); Serial.println(mqtt_device_id); } else { Serial.println("Failed to set WiFi Hostname."); }}
+    mqttClient.setServer(mqtt_server, mqtt_port); mqttClient.setCallback(mqttCallback); mqttClient.setBufferSize(1024);
+}
+
+void reconnectMqtt() {
+  if (WiFi.status() != WL_CONNECTED) { lastMqttReconnectAttempt = millis(); return; }
+  if (mqtt_device_id == "") { Serial.println("MQTT: mqtt_device_id is empty, generating..."); generateMqttIdAndTopics(); if (mqtt_device_id == "") { Serial.println("MQTT: CRITICAL - Failed to generate ID."); return; } }
+  if (!mqttClient.connected()) {
+    unsigned long now = millis();
+    if (now - lastMqttReconnectAttempt > mqttReconnectInterval) {
+      lastMqttReconnectAttempt = now;
+      Serial.print("MQTT Attempting connection to "); Serial.print(mqtt_server); Serial.print(" (Client ID: "); Serial.print(mqtt_device_id); Serial.println(")...");
+      if (mqttClient.connect(mqtt_device_id.c_str(), mqtt_user, mqtt_pass, ha_availability_topic.c_str(), 0, true, HA_PAYLOAD_OFFLINE)) {
+        Serial.println("MQTT connected!"); publishAvailability(true);
+        mqttClient.subscribe(ha_command_topic.c_str()); mqttClient.subscribe(ha_number_mv_len_cmd_topic.c_str()); mqttClient.subscribe(ha_number_add_leds_cmd_topic.c_str());
+        mqttClient.subscribe(ha_number_gradient_cmd_topic.c_str()); mqttClient.subscribe(ha_number_center_shift_cmd_topic.c_str()); mqttClient.subscribe(ha_number_off_delay_cmd_topic.c_str());
+        mqttClient.subscribe(ha_number_stat_intens_cmd_topic.c_str()); Serial.println("MQTT Subscribed to command topics.");
+        mqtt_discovery_published = false; mqtt_discovery_numbers_published = false; publishDiscovery();
+        publishState(); publishParameterStates();
+      } else { Serial.print("MQTT connect failed, rc="); Serial.print(mqttClient.state()); Serial.println(" Retrying..."); }
+    }
+  }
+}
+
+void mqttTask(void * parameter) {
+  Serial.println("MQTT Task started.");
+  for (;;) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (mqtt_device_id == "" || ha_command_topic == "") { Serial.println("MQTT Task: WiFi connected, generating ID/topics..."); generateMqttIdAndTopics(); if(mqtt_device_id == "" || ha_command_topic == "") { Serial.println("MQTT Task: ID/topic generation failed. Will retry."); vTaskDelay(pdMS_TO_TICKS(5000)); continue; }}
+      if (!mqttClient.connected()) { reconnectMqtt(); } mqttClient.loop();
+    } else { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+// --- MQTT INTEGRATION END ---
+
+// ------------------------- Web Server -------------------------
+WebServer server(80);
+void handleRoot(); void handleSetInterval(); void handleSetLedOffDelay(); void handleSetBaseColor();
+void handleSetMovingIntensity(); void handleSetStationaryIntensity(); void handleSetMovingLength();
+void handleSetAdditionalLEDs(); void handleSetCenterShift(); void handleSetGradientSoftness();
+void handleSetTime(); void handleSetSchedule(); void handleNotFound(); void handleSmartHomeOn();
+void handleSmartHomeOff(); void handleToggleBackgroundMode(); void handleGetCurrentTime();
+
+void handleSmartHomeOn() { lightOn = true; smarthomeOverride = true; current_ha_effect = HA_EFFECT_SOLID; backgroundModeActive = false; server.send(200, "text/plain", "Smart Home Override: ON"); publishState(); }
+void handleSmartHomeOff() { lightOn = false; smarthomeOverride = true; server.send(200, "text/plain", "Smart Home Override: OFF"); publishState(); }
+void handleSmartHomeClear(bool isHttpRequest = true) { smarthomeOverride = false; current_ha_effect = HA_EFFECT_SCHEDULE; backgroundModeActive = false; Serial.println("Smart Home Override Cleared. Switched to HA_EFFECT_SCHEDULE."); updateTime(); if (isHttpRequest) { server.send(200, "text/plain", "Smart Home Override: CLEARED. Schedule active."); }}
+
+void handleToggleBackgroundMode() {
+  // This web button now primarily toggles between HA_EFFECT_SOLID and HA_EFFECT_BACKGROUND
+  // It assumes 'smarthomeOverride = true' because it's a manual web action.
+  smarthomeOverride = true;
+  if (current_ha_effect == HA_EFFECT_BACKGROUND || current_ha_effect == HA_EFFECT_STATIONARY) {
+    current_ha_effect = HA_EFFECT_SOLID;
+    backgroundModeActive = false; // Explicitly turn off for Solid
+  } else {
+    current_ha_effect = HA_EFFECT_BACKGROUND;
+    backgroundModeActive = true; // Explicitly turn on for Background
+    if (!lightOn) lightOn = true; // Turn on if activating background
+  }
+  Serial.print("Web Toggle Background: New HA Effect: "); Serial.println(current_ha_effect);
+  server.sendHeader("Location", "/"); server.send(303);
+  publishState();
+}
+
+unsigned int readSensorData() {
+#ifndef SIMULATE_SENSOR
+  if (Serial1.available() < 7) return g_sensorDistance; if (Serial1.read() != SENSOR_HEADER) { while (Serial1.available()) Serial1.read(); return g_sensorDistance; } if (Serial1.read() != SENSOR_HEADER) { while (Serial1.available()) Serial1.read(); return g_sensorDistance; } byte buf[5]; size_t bytesRead = Serial1.readBytes(buf, 5); if (bytesRead < 5) { while (Serial1.available()) Serial1.read(); return g_sensorDistance; } unsigned int distance = (buf[2] << 8) | buf[1]; if (distance < MIN_DISTANCE || distance > MAX_DISTANCE) return g_sensorDistance; return distance;
+#else
+  static unsigned int simulatedDistance = MIN_DISTANCE; static int simDir = 10; simulatedDistance += simDir; if (simulatedDistance >= MAX_DISTANCE - 50) simDir = -10; if (simulatedDistance <= MIN_DISTANCE + 50) simDir = 10; return simulatedDistance;
+#endif
+}
+
+void sensorTask(void * parameter) { Serial.println("Sensor Task started"); for (;;) { unsigned int newDistance = readSensorData(); g_sensorDistance = newDistance; vTaskDelay(pdMS_TO_TICKS(5));}}
+void ledTask(void * parameter) {
+  static unsigned int lastSensor = g_sensorDistance; static int lastMovementDirection = 0; static unsigned long lastMovementTime = millis();
+  FastLED.clear(); FastLED.show(); vTaskDelay(pdMS_TO_TICKS(1000)); Serial.println("LED Task initialized and starting main loop");
+  for (;;) {
+    unsigned long currentMillis = millis(); unsigned int currentDistance = g_sensorDistance; bool isLightActive = lightOn;
+    bool actualBackgroundOn = (current_ha_effect == HA_EFFECT_BACKGROUND) || (current_ha_effect == HA_EFFECT_STATIONARY);
+    if (!isLightActive) { fill_solid(leds, NUM_LEDS, CRGB::Black); } 
+    else if (actualBackgroundOn) { uint8_t r = max((uint8_t)1, (uint8_t)(baseColor.r * stationaryIntensity)); uint8_t g = max((uint8_t)1, (uint8_t)(baseColor.g * stationaryIntensity)); uint8_t b = max((uint8_t)1, (uint8_t)(baseColor.b * stationaryIntensity)); fill_solid(leds, NUM_LEDS, CRGB(r, g, b)); }
+    else { fill_solid(leds, NUM_LEDS, CRGB::Black); }
+    if (isLightActive && current_ha_effect != HA_EFFECT_STATIONARY) {
+        int diff = (int)currentDistance - (int)lastSensor; int absDiff = abs(diff);
+        if (absDiff >= NOISE_THRESHOLD) { if (currentMillis - lastMovementTime > 50 || (diff > 0 && lastMovementDirection < 0) || (diff < 0 && lastMovementDirection > 0)) { lastMovementTime = currentMillis; lastMovementDirection = (diff > 0) ? 1 : -1; }}
+        lastSensor = currentDistance; bool drawMovingPart = (currentMillis - lastMovementTime <= (unsigned long)ledOffDelay * 1000);
+        if (drawMovingPart) {
+            float prop = constrain((float)(currentDistance - MIN_DISTANCE) / (MAX_DISTANCE - MIN_DISTANCE), 0.0, 1.0); int ledPosition = round(prop * (NUM_LEDS - 1)); int centerLED = constrain(ledPosition + centerShift, 0, NUM_LEDS - 1);
+            CRGB fullBrightColor = CRGB((uint8_t)(baseColor.r * movingIntensity), (uint8_t)(baseColor.g * movingIntensity), (uint8_t)(baseColor.b * movingIntensity));
+            int direction = lastMovementDirection; if (direction == 0) direction = 1; int halfMainLength = movingLength / 2; int totalLightLength = movingLength + additionalLEDs; if (totalLightLength <= 0) totalLightLength = 1;
+            int leftEdge, rightEdge; if (direction > 0) { leftEdge = centerLED - halfMainLength; rightEdge = leftEdge + movingLength - 1 + additionalLEDs; } else { rightEdge = centerLED + halfMainLength; leftEdge = rightEdge - movingLength + 1 - additionalLEDs; }
+            leftEdge = max(0, leftEdge); rightEdge = min(NUM_LEDS - 1, rightEdge); int effectiveFadeWidth = map(gradientSoftness, 0, 10, 1, 10); float effectiveFadeExponent = 1.0 + (gradientSoftness / 10.0) * 2.0;
+            int actualBeamPixelLength = rightEdge - leftEdge + 1; effectiveFadeWidth = constrain(effectiveFadeWidth, 1, max(1, actualBeamPixelLength / 2));
+            for (int i = leftEdge; i <= rightEdge; i++) {
+                int posInBeam; if (direction > 0) { posInBeam = i - leftEdge; } else { posInBeam = rightEdge - i; } float factor = 1.0f;
+                if (gradientSoftness > 0 && totalLightLength > 1) { if (posInBeam < effectiveFadeWidth) { float normalizedPos = (effectiveFadeWidth > 0) ? (float)(posInBeam + 1) / (effectiveFadeWidth + 1) : 1.0f; factor = pow(normalizedPos, effectiveFadeExponent); } else if (posInBeam >= (totalLightLength - effectiveFadeWidth)) { int posFromEnd = totalLightLength - 1 - posInBeam; float normalizedPos = (effectiveFadeWidth > 0) ? (float)(posFromEnd + 1) / (effectiveFadeWidth + 1) : 1.0f; factor = pow(normalizedPos, effectiveFadeExponent); }}
+                factor = constrain(factor, 0.0f, 1.0f);
+                if (factor > 0.01f) { CRGB beamColor; beamColor.r = (uint8_t)(fullBrightColor.r * factor); beamColor.g = (uint8_t)(fullBrightColor.g * factor); beamColor.b = (uint8_t)(fullBrightColor.b * factor); leds[i].r = max(beamColor.r, leds[i].r); leds[i].g = max(beamColor.g, leds[i].g); leds[i].b = max(beamColor.b, leds[i].b); }
+            }
+        }
+    }
+    FastLED.show(); vTaskDelay(pdMS_TO_TICKS(updateInterval));
+  }
+}
+void webServerTask(void * parameter) { Serial.println("Web Server Task started"); for (;;) { if (WiFi.status() == WL_CONNECTED || WiFi.softAPgetStationNum() > 0) { server.handleClient(); } ArduinoOTA.handle(); vTaskDelay(pdMS_TO_TICKS(2)); }}
+
+void handleSetTime() { bool tu = false; bool tzu = false; if (server.hasArg("tz")) { int tzo = server.arg("tz").toInt(); if (tzo >= -720 && tzo <= 840) { if (!isTimeOffsetSet || clientTimezoneOffsetMinutes != tzo) { clientTimezoneOffsetMinutes = tzo; isTimeOffsetSet = true; tzu = true; saveSettings(); }} else { Serial.print("Invalid TZ: "); Serial.println(tzo); }} if (server.hasArg("epoch")) { unsigned long e = strtoul(server.arg("epoch").c_str(), NULL, 10); if (e > 946684800UL) { struct timeval tv; tv.tv_sec = e; tv.tv_usec = 0; settimeofday(&tv, NULL); tu = true; } else { Serial.print("Invalid epoch: "); Serial.println(e); }} if (tu || tzu) { updateTime(); } String r = ""; if(tu) r += "Time OK"; if(tzu) r += (r.length() > 0 ? ", TZ OK" : "TZ OK"); if(r.length() == 0) r = "No change"; server.send(200, "text/plain", r); }
+void updateTime() { time_t nu = time(nullptr); static bool ltv = false; bool ctv = (nu > 1000000000UL); if (ctv && !ltv) { Serial.println("NTP OK!"); } ltv = ctv; if (!ctv || !isTimeOffsetSet) { return; } time_t cle = nu + (clientTimezoneOffsetMinutes * 60); struct tm til; gmtime_r(&cle, &til); int ctm = til.tm_hour * 60 + til.tm_min; int stm = startHour * 60 + startMinute; int etm = endHour * 60 + endMinute; bool sbo; if (stm <= etm) { sbo = (ctm >= stm && ctm < etm); } else { sbo = (ctm >= stm || ctm < etm); } bool sac = false; if (!smarthomeOverride && (lightOn != sbo)) { lightOn = sbo; sac = true; Serial.print("Schedule set light: "); Serial.println(lightOn ? "ON" : "OFF"); } static unsigned long lssp = 0; if (sac || (mqttClient.connected() && (millis() - lssp > 30000))) { if (current_ha_effect == HA_EFFECT_SCHEDULE) { publishState(); lssp = millis(); }}}
+void handleGetCurrentTime() { char ts[20] = "N/A"; time_t nu = time(nullptr); if (nu > 1000000000UL && isTimeOffsetSet) { time_t cle = nu + (clientTimezoneOffsetMinutes * 60); struct tm tic; gmtime_r(&cle, &tic); strftime(ts, sizeof(ts), "%H:%M:%S", &tic); } else if (nu > 1000000000UL && !isTimeOffsetSet) { strcpy(ts, "TZ Not Set"); } else { strcpy(ts, "Sync Pend"); } String j = "{\"time\":\""; j += ts; j += "\"}"; server.send(200, "application/json", j); }
+void handleSetSchedule() { if (server.hasArg("startHour") && server.hasArg("startMinute") && server.hasArg("endHour") && server.hasArg("endMinute")) { startHour = server.arg("startHour").toInt(); startMinute = server.arg("startMinute").toInt(); endHour = server.arg("endHour").toInt(); endMinute = server.arg("endMinute").toInt(); startHour = constrain(startHour,0,23); startMinute = constrain(startMinute,0,59); endHour = constrain(endHour,0,23); endMinute = constrain(endMinute,0,59); saveSettings(); updateTime(); } server.sendHeader("Location", "/"); server.send(303); }
+void handleNotFound() { server.send(404, "text/plain", "Not Found"); }
+
+bool setupWiFi() { WiFi.mode(WIFI_STA); Serial.print("Connecting to WiFi: '"); Serial.print(main_wifi_ssid); Serial.println("'..."); WiFi.begin(main_wifi_ssid, main_wifi_password); unsigned long wst = millis(); while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); if (millis() - wst > 20000) { Serial.println("\nWiFi Connection FAILED!"); return false; }} Serial.println("\nWiFi connected!"); Serial.print("IP: "); Serial.println(WiFi.localIP()); generateMqttIdAndTopics(); server.on("/", HTTP_GET, handleRoot); server.on("/setInterval", HTTP_GET, handleSetInterval); server.on("/setLedOffDelay", HTTP_GET, handleSetLedOffDelay); server.on("/setBaseColor", HTTP_GET, handleSetBaseColor); server.on("/setMovingIntensity", HTTP_GET, handleSetMovingIntensity); server.on("/setStationaryIntensity", HTTP_GET, handleSetStationaryIntensity); server.on("/setMovingLength", HTTP_GET, handleSetMovingLength); server.on("/setAdditionalLEDs", HTTP_GET, handleSetAdditionalLEDs); server.on("/setCenterShift", HTTP_GET, handleSetCenterShift); server.on("/setGradientSoftness", HTTP_GET, handleSetGradientSoftness); server.on("/setTime", HTTP_GET, handleSetTime); server.on("/setSchedule", HTTP_GET, handleSetSchedule); server.on("/smarthome/on", HTTP_GET, handleSmartHomeOn); server.on("/smarthome/off", HTTP_GET, handleSmartHomeOff); server.on("/smarthome/clear", HTTP_GET, [](){ handleSmartHomeClear(true); }); server.on("/toggleNightMode", HTTP_GET, handleToggleBackgroundMode); server.on("/getCurrentTime", HTTP_GET, handleGetCurrentTime); server.onNotFound(handleNotFound); server.begin(); Serial.println("Web server started."); return true; }
+
+void handleRoot() { char sss[6]; sprintf(sss, "%02d:%02d", startHour, startMinute); char ses[6]; sprintf(ses, "%02d:%02d", endHour, endMinute); int mip = round(movingIntensity * 100.0); float sip = stationaryIntensity * 1000.0; bool wbbo = (current_ha_effect == HA_EFFECT_BACKGROUND) || (current_ha_effect == HA_EFFECT_STATIONARY); String h = ""; h += "<!DOCTYPE html><html><head><title>LED Control</title><meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no'><style>body{margin:0;padding:0;background-color:#282c34;color:#abb2bf;font-family:Arial,sans-serif}.container{text-align:center;width:90%;max-width:600px;margin:auto;padding:15px;box-sizing:border-box}h1{color:#61afef;font-size:1.5em;margin-bottom:15px}input[type=range]{width:100%;margin:8px 0;-webkit-appearance:none;appearance:none;height:10px;background:#414853;border-radius:5px;outline:none}input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:20px;height:20px;background:#61afef;border-radius:50%;cursor:pointer;border:2px solid #282c34}input[type=range]::-moz-range-thumb{width:20px;height:20px;background:#61afef;border-radius:50%;cursor:pointer;border:2px solid #282c34}input[type=color]{width:80px;height:80px;border:none;border-radius:8px;display:block;margin:10px auto;padding:0;background-color:transparent}input[type=time]{font-size:1em;margin:5px;padding:5px 8px;background-color:#414853;color:#abb2bf;border:1px solid #333942;border-radius:4px}button{font-size:.9em;margin:8px 5px;padding:10px 15px;background-color:#61afef;color:#282c34;border:none;border-radius:4px;cursor:pointer;transition:background-color .2s}button:hover{background-color:#5295c9}.button-off{background-color:#e06c75!important}.button-off:hover{background-color:#c95a63!important}hr{border:none;height:1px;background:#414853;margin:20px 0}p{margin-bottom:3px;margin-top:12px;font-size:.9em}.current-time,.footer{font-size:.8em;color:#7f8893;margin-top:10px}.section-title{font-size:1.1em;color:#98c379;margin-top:20px;margin-bottom:5px}</style><script>function setDeviceTime(){var n=new Date,e=Math.floor(n.getTime()/1e3),t=-n.getTimezoneOffset();fetch(\"/setTime?epoch=\"+e+\"&tz=\"+t).then(n=>n.text()).then(n=>{console.log(\"Set time:\",n),updateTimeDisplay()})}function updateTimeDisplay(){fetch(\"/getCurrentTime\").then(n=>n.json()).then(n=>{document.getElementById(\"currentTimeDisplay\").innerText=n.time}).catch(n=>console.error(\"Time fetch err:\",n))}function debounce(n,e){let t;return function(...o){clearTimeout(t),t=setTimeout(()=>n.apply(this,o),e)}}const sendColor=debounce(n=>{var e=parseInt(n.substring(1,3),16),t=parseInt(n.substring(3,5),16),o=parseInt(n.substring(5,7),16);fetch(\"/setBaseColor?r=\"+e+\"&g=\"+t+\"&b=\"+o)},250),sendRange=debounce((n,e)=>{fetch(n+e)},250);function setSchedule(n,e){var t=n.split(\":\"),o=e.split(\":\");fetch(\"/setSchedule?startHour=\"+t[0]+\"&startMinute=\"+t[1]+\"&endHour=\"+o[0]+\"&endMinute=\"+o[1]).then(()=>setTimeout(()=>location.reload(),200))}function toggleBg(){fetch(\"/toggleNightMode\").then(()=>setTimeout(()=>location.reload(),200))}setInterval(updateTimeDisplay,5e3),setInterval(setDeviceTime,36e5),window.onload=()=>{setDeviceTime(),updateTimeDisplay()};</script></head><body><div class='container'><h1>LightTrack Control</h1><input type='color' id='baseColorPicker' value='#"; h += String((baseColor.r < 16 ? "0" : "") + String(baseColor.r, HEX)); h += String((baseColor.g < 16 ? "0" : "") + String(baseColor.g, HEX)); h += String((baseColor.b < 16 ? "0" : "") + String(baseColor.b, HEX)); h += "' oninput='sendColor(this.value)'><p class='section-title'>Moving Light</p><p>Intensity: <span id='miv'>"; h += String(mip); h += "</span>%</p><input type='range' min='0' max='100' value='"; h += String(mip); h += "' oninput='document.getElementById(\"miv\").innerText=this.value; sendRange(\"/setMovingIntensity?value=\", this.value)'><p>Length: <span id='mlv'>"; h += String(movingLength); h += "</span></p><input type='range' min='1' max='"; h += String(NUM_LEDS); h += "' value='"; h += String(movingLength); h += "' oninput='document.getElementById(\"mlv\").innerText=this.value; sendRange(\"/setMovingLength?value=\", this.value)'><p>Trail LEDs: <span id='alv'>"; h += String(additionalLEDs); h += "</span></p><input type='range' min='0' max='"; h += String(NUM_LEDS/2); h += "' value='"; h += String(additionalLEDs); h += "' oninput='document.getElementById(\"alv\").innerText=this.value; sendRange(\"/setAdditionalLEDs?value=\", this.value)'><p>Gradient: <span id='gsv'>"; h += String(gradientSoftness); h += "</span></p><input type='range' min='0' max='10' value='"; h += String(gradientSoftness); h += "' oninput='document.getElementById(\"gsv\").innerText=this.value; sendRange(\"/setGradientSoftness?value=\", this.value)'><p>Center Shift: <span id='csv'>"; h += String(centerShift); h += "</span></p><input type='range' min='-"; h += String(NUM_LEDS/2); h += "' max='"; h += String(NUM_LEDS/2); h += "' value='"; h += String(centerShift); h += "' oninput='document.getElementById(\"csv\").innerText=this.value; sendRange(\"/setCenterShift?value=\", this.value)'><p>Off Delay: <span id='lodv'>"; h += String(ledOffDelay); h += "</span>s</p><input type='range' min='1' max='60' value='"; h += String(ledOffDelay); h += "' oninput='document.getElementById(\"lodv\").innerText=this.value; sendRange(\"/setLedOffDelay?value=\", this.value)'><hr><p class='section-title'>Background Light</p><button onclick='toggleBg()' class='"; h += (wbbo ? "button-off" : ""); h += "'>"; h += (wbbo ? "Turn Off" : "Turn On"); h += " Background</button><p>Intensity: <span id='siv'>"; h += String(sip, 1); h += "</span>%</p><input type='range' min='0' max='100' step='0.1' value='"; h += String(sip, 1); h += "' oninput='document.getElementById(\"siv\").innerText=parseFloat(this.value).toFixed(1); sendRange(\"/setStationaryIntensity?value=\", this.value)'><hr><p class='section-title'>Schedule (Local Time)</p><div style='display:flex;justify-content:center;gap:10px;align-items:center;'><input type='time' id='sStart' value='"; h += String(sss); h += "'><span>to</span><input type='time' id='sEnd' value='"; h += String(ses); h += "'></div><button onclick='setSchedule(document.getElementById(\"sStart\").value, document.getElementById(\"sEnd\").value)'>Set Schedule</button><div class='current-time'>Est. Local: <span id='currentTimeDisplay'>Loading...</span></div><hr><p class='section-title'>Device Control (HA)</p><div style='display:flex; justify-content:center; gap:10px;'><button onclick=\"fetch('/smarthome/on').then(()=>setTimeout(()=>location.reload(),200))\">Force ON</button><button onclick=\"fetch('/smarthome/off').then(()=>setTimeout(()=>location.reload(),200))\" class='button-off'>Force OFF</button><button onclick=\"fetch('/smarthome/clear').then(()=>setTimeout(()=>location.reload(),200))\">Use Schedule</button></div><div class='footer'>DIY Yari & AI | MQTT v2.2</div></div></body></html>"; server.send(200, "text/html", h); }
+
+void handleSetInterval() { if (server.hasArg("value")) { updateInterval = server.arg("value").toInt(); if(updateInterval < 10) updateInterval = 10; saveSettings(); } server.send(200, "text/plain", "OK"); }
+void handleSetLedOffDelay() { if (server.hasArg("value")) { ledOffDelay = server.arg("value").toInt(); ledOffDelay = constrain(ledOffDelay, 1, 60); saveSettings(); publishParameterStates(); } server.send(200, "text/plain", "OK"); }
+void handleSetBaseColor() { if (server.hasArg("r") && server.hasArg("g") && server.hasArg("b")) { baseColor = CRGB(server.arg("r").toInt(), server.arg("g").toInt(), server.arg("b").toInt()); saveSettings(); publishState(); } server.send(200, "text/plain", "OK"); } // baseColor is handled by publishState
+void handleSetMovingLength() { if (server.hasArg("value")) { movingLength = server.arg("value").toInt(); movingLength = constrain(movingLength, 1, NUM_LEDS); saveSettings(); publishParameterStates(); } server.send(200, "text/plain", "OK"); }
+void handleSetAdditionalLEDs() { if (server.hasArg("value")) { additionalLEDs = server.arg("value").toInt(); additionalLEDs = constrain(additionalLEDs, 0, NUM_LEDS / 2); saveSettings(); publishParameterStates(); } server.send(200, "text/plain", "OK"); }
+void handleSetCenterShift() { if (server.hasArg("value")) { centerShift = server.arg("value").toInt(); centerShift = constrain(centerShift, -NUM_LEDS / 2, NUM_LEDS / 2); saveSettings(); publishParameterStates(); } server.send(200, "text/plain", "OK"); }
+void handleSetMovingIntensity() { if (server.hasArg("value")) { float vp = server.arg("value").toFloat(); movingIntensity = constrain(vp / 100.0, 0.0, 1.0); saveSettings(); publishState(); } server.send(200, "text/plain", "OK"); } // movingIntensity (brightness) is handled by publishState
+void handleSetStationaryIntensity() { if (server.hasArg("value")) { float vp = server.arg("value").toFloat(); stationaryIntensity = constrain(vp / 1000.0, 0.0, 0.1); saveSettings(); publishParameterStates(); } server.send(200, "text/plain", "OK"); }
+void handleSetGradientSoftness() { if (server.hasArg("value")) { gradientSoftness = server.arg("value").toInt(); gradientSoftness = constrain(gradientSoftness, 0, 10); saveSettings(); publishParameterStates(); } server.send(200, "text/plain", "OK"); }
+
+void setupOTA() { String ho = "LightTrack-OTA-Unknown"; if (mqtt_device_id != "") { ho = mqtt_device_id; } else { uint8_t mo[6]; if (esp_wifi_get_mac(WIFI_IF_STA, mo) == ESP_OK) { char ms[7]; sprintf(ms, "%02X%02X%02X", mo[3], mo[4], mo[5]); ho = "LightTrack-OTA-" + String(ms); } else { uint64_t cf = ESP.getEfuseMac(); uint32_t cp = (uint32_t)(cf >> 24); ho = "LightTrack-OTA-" + String(cp, HEX); } Serial.print("OTA fallback hostname: "); Serial.println(ho); } ArduinoOTA.setHostname(ho.c_str()); ArduinoOTA.onStart([]() { String t = ArduinoOTA.getCommand() == U_FLASH ? "sketch" : "filesystem"; Serial.println("OTA Start: " + t); if (mqttClient.connected()) { publishAvailability(false); } }); ArduinoOTA.onEnd([]() { Serial.println("\nOTA End"); }); ArduinoOTA.onProgress([](unsigned int p, unsigned int t) { Serial.printf("OTA Progress: %u%%\r", (p / (t / 100))); }); ArduinoOTA.onError([](ota_error_t e) { Serial.printf("OTA Error[%u]: ", e); if (e == OTA_AUTH_ERROR) Serial.println("Auth Failed"); else if (e == OTA_BEGIN_ERROR) Serial.println("Begin Failed"); else if (e == OTA_CONNECT_ERROR) Serial.println("Connect Failed"); else if (e == OTA_RECEIVE_ERROR) Serial.println("Receive Failed"); else if (e == OTA_END_ERROR) Serial.println("End Failed"); }); ArduinoOTA.begin(); Serial.print("OTA Initialized. Hostname: "); Serial.println(ArduinoOTA.getHostname()); }
+
+void setup() {
+  Serial.begin(115200); delay(500); Serial.println("\n\n--- LightTrack MQTT v2.2 ---");
+  uint64_t cid = ESP.getEfuseMac(); randomSeed((unsigned long)cid ^ (unsigned long)(cid >> 32));
+  Serial.println("LEDs Init..."); FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip); FastLED.setBrightness(255); FastLED.clear(); leds[0] = CRGB::Red; FastLED.show();
+  Serial.println("SPIFFS/EEPROM Init..."); if (!SPIFFS.begin(true)) { Serial.println("SPIFFS Mount Fail. Formatting..."); if (!SPIFFS.format()) { Serial.println("SPIFFS Format FAILED."); } else { Serial.println("SPIFFS Formatted. REBOOTING."); delay(3000); ESP.restart(); }} loadSettings();
+  Serial.println("Sensor Init..."); Serial1.begin(256000, SERIAL_8N1, 20, 21);
+  leds[0] = CRGB::Yellow; FastLED.show(); bool wcis = setupWiFi();
+  Serial.println("NTP Init..."); configTzTime("UTC0", "pool.ntp.org", "time.nist.gov");
+  Serial.println("OTA Init..."); setupOTA();
+  if (wcis) { leds[0] = CRGB::Green; FastLED.show(); } else { leds[0] = CRGB::Blue; FastLED.show(); Serial.println("Initial WiFi FAILED.");}
+  Serial.println("MQTT Task Create..."); xTaskCreatePinnedToCore(mqttTask, "MQTTTask", 4096, NULL, 1, &mqttTaskHandle, 0);
+  delay(1000); leds[0] = CRGB::Black; FastLED.show();
+  Serial.println("RTOS Tasks Create (Sensor, LED, Web)...");
+  xTaskCreatePinnedToCore(sensorTask, "Sensor", 2048, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(ledTask, "LED", 8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(webServerTask, "Web", 4096, NULL, 1, NULL, 0);
+  Serial.println("--- Setup Complete ---");
+  if (WiFi.status() == WL_CONNECTED) { Serial.print("Web UI: http://"); Serial.println(WiFi.localIP()); } else { Serial.println("WiFi not connected. Web UI unavailable."); }
+  Serial.println("----------------------");
+}
+
+void loop() {
+  updateTime();
+  static unsigned long ll = 0; static IPAddress ldip = IPAddress(0,0,0,0);
+  if (millis() - ll > 15000) {
+      ll = millis(); Serial.println("--- Status ---"); Serial.print("Uptime: "); Serial.print(millis()/1000); Serial.println("s");
+      wl_status_t ws = WiFi.status(); Serial.print("WiFi: "); if(ws == WL_CONNECTED) { Serial.print("OK IP:"); Serial.println(WiFi.localIP()); if(WiFi.localIP()!=ldip && WiFi.localIP()!=IPAddress(0,0,0,0)){ ldip=WiFi.localIP(); Serial.print("Web: http://"); Serial.println(ldip);}} else { Serial.print("Fail("); Serial.print(ws); Serial.println(")");}
+      Serial.print("MQTT: "); Serial.println(mqttClient.connected() ? "OK" : "Fail");
+      time_t n = time(nullptr); if (n < 1000000000UL) { Serial.println("Time: NTP Sync Pend"); } else { struct tm ti; gmtime_r(&n, &ti); char ub[25]; strftime(ub, sizeof(ub), "%F %T", &ti); Serial.print("UTC: "); Serial.println(ub); if (isTimeOffsetSet) { time_t cle = n+(clientTimezoneOffsetMinutes*60); struct tm tic; gmtime_r(&cle, &tic); char lb[20]; strftime(lb, sizeof(lb), "%T", &tic); Serial.print("Local: "); Serial.print(lb); Serial.print(" (Off:"); Serial.print(clientTimezoneOffsetMinutes); Serial.println("m)");} else {Serial.println("Local: TZ Not Set");}}
+      Serial.printf("Sched: %02d:%02d-%02d:%02d (L) Light:%s HA-Eff:%s Ovrd:%s\n", startHour,startMinute,endHour,endMinute, lightOn?"ON":"OFF", current_ha_effect.c_str(), smarthomeOverride?"Y":"N");
+      Serial.printf("MovInt:%.0f%% StatInt:%.1f%% MovLen:%d Trail:%d Grad:%d Shift:%d OffDel:%ds\n", movingIntensity*100.0, stationaryIntensity*100.0, movingLength, additionalLEDs, gradientSoftness, centerShift, ledOffDelay); // Note: stationaryIntensity for log is 0-10%, MQTT is 0-100 for HA
+      Serial.print("Heap: "); Serial.println(ESP.getFreeHeap()); Serial.println("--------------");
+  }
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
